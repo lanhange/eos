@@ -8,6 +8,7 @@
 #include <eosio/chain/permission_object.hpp>
 #include <eosio/chain/fork_database.hpp>
 #include <eosio/chain/block_log.hpp>
+#include <eosio/chain/block_trace.hpp>
 
 #include <chainbase/chainbase.hpp>
 #include <fc/scoped_exit.hpp>
@@ -18,7 +19,9 @@
 #include <eosio/chain/apply_context.hpp>
 #include <eosio/chain/exceptions.hpp>
 #include <eosio/chain/contracts/genesis_state.hpp>
+#include <eosio/chain/resource_limits.hpp>
 #include <eosio/chain/wasm_interface.hpp>
+#include <eosio/chain/webassembly/runtime_interface.hpp>
 
 #include <fc/log/logger.hpp>
 
@@ -27,7 +30,8 @@
 namespace eosio { namespace chain {
    using database = chainbase::database;
    using boost::signals2::signal;
-
+   using resource_limits_manager = resource_limits::resource_limits_manager;
+   class generated_transaction_object;
 
    namespace contracts{ class chain_initializer; }
 
@@ -45,7 +49,7 @@ namespace eosio { namespace chain {
       skip_assert_evaluation      = 1 << 8,  ///< used while reindexing
       skip_undo_history_check     = 1 << 9,  ///< used while reindexing
       skip_producer_schedule_check= 1 << 10, ///< used while reindexing
-      skip_validate               = 1 << 11, ///< used prior to checkpoint, skips validate() call on transaction
+      skip_validate               = 1 << 11, ///< used prior to checkpoint, skips transaction validation
       skip_scope_check            = 1 << 12, ///< used to skip checks for proper scope
       skip_output_check           = 1 << 13, ///< used to skip checks for outputs in block exactly matching those created from apply
       pushed_transaction          = 1 << 14, ///< used to indicate that the origination of the call was from a push_transaction, to determine time allotment
@@ -65,6 +69,7 @@ namespace eosio { namespace chain {
          struct runtime_limits {
             fc::microseconds               max_push_block_us = fc::microseconds(-1);
             fc::microseconds               max_push_transaction_us = fc::microseconds(-1);
+            fc::microseconds               max_deferred_transactions_us = fc::microseconds(-1);
          };
 
          struct controller_config {
@@ -77,6 +82,7 @@ namespace eosio { namespace chain {
             std::vector<signal<void(const transaction_metadata&, const packed_transaction&)>::slot_type> on_pending_transaction_callbacks;
             contracts::genesis_state_type  genesis;
             runtime_limits                 limits;
+            wasm_interface::vm_type        wasm_runtime        =  config::default_wasm_runtime;
          };
 
          explicit chain_controller( const controller_config& cfg );
@@ -85,9 +91,9 @@ namespace eosio { namespace chain {
 
          void push_block( const signed_block& b, uint32_t skip = skip_nothing );
          transaction_trace push_transaction( const packed_transaction& trx, uint32_t skip = skip_nothing );
-         void push_deferred_transactions( bool flush = false );
-
-
+         vector<transaction_trace> push_deferred_transactions( bool flush = false, uint32_t skip = skip_nothing );
+         
+         uint128_t transaction_id_to_sender_id( const transaction_id_type& tid )const;
 
       /**
           *  This signal is emitted after all operations and virtual operation for a
@@ -112,7 +118,7 @@ namespace eosio { namespace chain {
           * This signal is emitted any time a new transaction is added to the pending
           * block state.
           */
-      signal<void(const transaction_metadata&, const packed_transaction&)> on_pending_transaction;
+         signal<void(const transaction_metadata&, const packed_transaction&)> on_pending_transaction;
 
 
 
@@ -265,29 +271,45 @@ namespace eosio { namespace chain {
          uint32_t             head_block_num()const;
          block_id_type        head_block_id()const;
          account_name         head_block_producer()const;
+         block_header         head_block_header()const;
 
          uint32_t last_irreversible_block_num() const;
 
          const chainbase::database& get_database() const { return _db; }
          chainbase::database&       get_mutable_database() { return _db; }
 
-         wasm_cache& get_wasm_cache() {
-            return _wasm_cache;
+         const resource_limits::resource_limits_manager& get_resource_limits_manager() const { return _resource_limits; }
+         resource_limits::resource_limits_manager&       get_mutable_resource_limits_manager() { return _resource_limits; }
+
+         wasm_interface& get_wasm_interface() {
+            return _wasm_interface;
          }
 
-
          /**
+          * @param actions - the actions to check authorization across
           * @param provided_keys - the set of public keys which have authorized the transaction
+          * @param allow_unused_signatures - true if method should not assert on unused signatures
           * @param provided_accounts - the set of accounts which have authorized the transaction (presumed to be owner)
           *
-          * @return true if the provided keys and accounts are sufficient to authorize actions of the transaction
+          * @return fc::microseconds set to the max delay that this authorization requires to complete
           */
-         void check_authorization( const vector<action>& actions,
-                                   flat_set<public_key_type> provided_keys,
-                                   bool                      allow_unused_signatures = false,
-                                   flat_set<account_name>    provided_accounts = flat_set<account_name>()
-                                   )const;
+         fc::microseconds check_authorization( const vector<action>& actions,
+                                               const flat_set<public_key_type>& provided_keys,
+                                               bool                             allow_unused_signatures = false,
+                                               flat_set<account_name>           provided_accounts = flat_set<account_name>(),
+                                               flat_set<permission_level>       provided_levels = flat_set<permission_level>()
+                                             )const;
 
+         /**
+          * @param account - the account owner of the permission
+          * @param permission - the permission name to check for authorization
+          * @param provided_keys - a set of public keys
+          *
+          * @return true if the provided keys are sufficient to authorize the account permission
+          */
+         bool check_authorization( account_name account, permission_name permission,
+                                flat_set<public_key_type> provided_keys,
+                                bool allow_unused_signatures)const;
 
       private:
          const apply_handler* find_apply_handler( account_name contract, scope_name scope, action_name act )const;
@@ -310,6 +332,15 @@ namespace eosio { namespace chain {
          transaction_trace _apply_transaction( transaction_metadata& data );
          transaction_trace __apply_transaction( transaction_metadata& data );
          transaction_trace _apply_error( transaction_metadata& data );
+         vector<transaction_trace> _push_deferred_transactions( bool flush = false );
+
+         void _destroy_generated_transaction( const generated_transaction_object& gto );
+         void _create_generated_transaction( const deferred_transaction& dto );
+
+         template<typename TransactionProcessing>
+         transaction_trace wrap_transaction_processing( transaction_metadata&& data, TransactionProcessing trx_processing );
+
+         transaction_trace delayed_transaction_processing( const transaction_metadata& mtrx );
 
          /// Reset the object graph in-memory
          void _initialize_indexes();
@@ -333,36 +364,29 @@ namespace eosio { namespace chain {
             return f();
          }
 
-         void check_transaction_authorization(const transaction& trx,
-                                              const vector<signature_type>& signatures,
-                                              bool allow_unused_signatures = false)const;
+         fc::microseconds check_transaction_authorization(const transaction& trx,
+                                                          const vector<signature_type>& signatures,
+                                                          const vector<bytes>&  cfd = vector<bytes>(),
+                                                          bool allow_unused_signatures = false)const;
 
 
          void require_scope(const scope_name& name) const;
          void require_account(const account_name& name) const;
 
-         /**
-          * This method performs some consistency checks on a transaction.
-          * @throw transaction_exception if the transaction is invalid
-          */
-         template<typename T>
-         void validate_transaction(const T& trx) const {
-         try {
-            EOS_ASSERT(trx.messages.size() > 0, transaction_exception, "A transaction must have at least one message");
-
-            validate_expiration(trx);
-            validate_uniqueness(trx);
-            validate_tapos(trx);
-
-         } FC_CAPTURE_AND_RETHROW( (trx) ) }
-
          /// Validate transaction helpers @{
-         void validate_uniqueness(const transaction& trx)const;
-         void validate_tapos(const transaction& trx)const;
-         void validate_referenced_accounts(const transaction& trx)const;
-         void validate_expiration(const transaction& trx) const;
-         void record_transaction(const transaction& trx);
+         void validate_uniqueness( const transaction& trx )const;
+         void validate_tapos( const transaction& trx )const;
+         void validate_referenced_accounts( const transaction& trx )const;
+         void validate_not_expired( const transaction& trx )const;
+         void validate_expiration_not_too_far( const transaction& trx, fc::time_point reference_time )const;
+         void validate_transaction_without_state( const transaction& trx )const;
+         void validate_transaction_with_minimal_state( const transaction& trx, uint32_t min_net_usage = 0 )const;
+         void validate_transaction_with_minimal_state( const packed_transaction& packed_trx, const transaction* trx_ptr = nullptr )const;
          /// @}
+
+         void record_transaction( const transaction& trx );
+         void update_resource_usage( transaction_trace& trace, const transaction_metadata& meta );
+
 
          /**
           * @brief Find the lowest authority level required for @ref authorizer_account to authorize a message of the
@@ -370,25 +394,35 @@ namespace eosio { namespace chain {
           * @param authorizer_account The account authorizing the message
           * @param code_account The account which publishes the contract that handles the message
           * @param type The type of message
-          * @return
           */
          optional<permission_name> lookup_minimum_permission( account_name authorizer_account,
                                                              scope_name code_account,
                                                              action_name type) const;
 
+         /**
+          * @brief Find the linked permission for the passed in parameters
+          * @param authorizer_account The account authorizing the message
+          * @param code_account The account which publishes the contract that handles the message
+          * @param type The type of message
+          * @return active permission or the linked permission if one exists
+          */
+         optional<permission_name> lookup_linked_permission( account_name authorizer_account,
+                                                   scope_name code_account,
+                                                   action_name type ) const;
 
          bool should_check_for_duplicate_transactions()const { return !(_skip_flags&skip_transaction_dupe_check); }
          bool should_check_tapos()const                      { return !(_skip_flags&skip_tapos_check);            }
+         bool should_check_signatures()const                 { return !(_skip_flags&skip_transaction_signatures); }
+         bool should_check_authorization()const              { return !(_skip_flags&skip_authority_check);        }
 
          ///Steps involved in applying a new block
          ///@{
          const producer_object& validate_block_header(uint32_t skip, const signed_block& next_block)const;
-         const producer_object& _validate_block_header(const signed_block& next_block)const;
          void create_block_summary(const signed_block& next_block);
 
          void update_global_properties(const signed_block& b);
          void update_global_dynamic_data(const signed_block& b);
-         void update_usage( transaction_metadata&, uint32_t act_usage );
+         void update_permission_usage( const transaction_metadata& meta );
          void update_signing_producer(const producer_object& signing_producer, const signed_block& new_block);
          void update_last_irreversible_block();
          void update_or_create_producers( const producer_schedule_type& producers);
@@ -398,13 +432,14 @@ namespace eosio { namespace chain {
          void _spinup_db();
          void _spinup_fork_db();
 
-         void _start_pending_block();
+         void _start_pending_block( bool skip_deferred = false );
          void _start_pending_cycle();
-         void _start_pending_shard();
          void _finalize_pending_cycle();
          void _apply_cycle_trace( const cycle_trace& trace );
-         void _finalize_block( const block_trace& b );
+         void _finalize_block( const block_trace& b, const producer_object& signing_producer );
 
+         transaction _get_on_block_transaction();
+         void _apply_on_block_transaction();
 
       //        producer_schedule_type calculate_next_round( const signed_block& next_block );
 
@@ -427,9 +462,10 @@ namespace eosio { namespace chain {
          typedef pair<scope_name,action_name>                   handler_key;
          map< account_name, map<handler_key, apply_handler> >   _apply_handlers;
 
-         wasm_cache                       _wasm_cache;
+         wasm_interface                   _wasm_interface;
 
          runtime_limits                   _limits;
+         resource_limits_manager          _resource_limits;
    };
 
 } }

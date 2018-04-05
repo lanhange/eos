@@ -11,14 +11,15 @@ static int global_variable = 45;
 
 extern "C" {
     /// The apply method implements the dispatch of events to this contract
-    void apply( uint64_t code, uint64_t action ) {
+    void apply( uint64_t receiver, uint64_t code, uint64_t action ) {
+       require_auth(code);
        if( code == N(asserter) ) {
           if( action == N(procassert) ) {
              assertdef check;
-             read_action(&check, sizeof(assertdef));
+             read_action_data(&check, sizeof(assertdef));
 
              unsigned char buffer[256];
-             size_t actsize = read_action(buffer, 256);
+             size_t actsize = read_action_data(buffer, 256);
              assertdef *def = reinterpret_cast<assertdef *>(buffer);
 
              // make sure to null term the string

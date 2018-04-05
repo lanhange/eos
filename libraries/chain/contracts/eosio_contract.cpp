@@ -14,6 +14,7 @@
 #include <eosio/chain/account_object.hpp>
 #include <eosio/chain/permission_object.hpp>
 #include <eosio/chain/permission_link_object.hpp>
+#include <eosio/chain/generated_transaction_object.hpp>
 #include <eosio/chain/global_property_object.hpp>
 #include <eosio/chain/contracts/types.hpp>
 #include <eosio/chain/producer_object.hpp>
@@ -21,57 +22,44 @@
 #include <eosio/chain/wasm_interface.hpp>
 #include <eosio/chain/contracts/abi_serializer.hpp>
 
-#include <eosio/chain/rate_limiting.hpp>
+#include <eosio/chain/resource_limits.hpp>
 
 namespace eosio { namespace chain { namespace contracts {
-
-void intialize_eosio_tokens(chainbase::database& db, const account_name& system_account, share_type initial_tokens) {
-   const auto& t_id = db.create<contracts::table_id_object>([&](contracts::table_id_object &t_id){
-      t_id.scope = system_account;
-      t_id.code = config::system_account_name;
-      t_id.table = N(currency);
-   });
-
-   db.create<key_value_object>([&](key_value_object &o){
-      o.t_id = t_id.id;
-      o.primary_key = N(account);
-      o.value.insert(0, reinterpret_cast<const char *>(&initial_tokens), sizeof(share_type));
-   });
-}
-
-static void modify_eosio_balance( apply_context& context, const account_name& account, share_type amt) {
-   const auto& t_id = context.find_or_create_table(config::system_account_name, account, N(currency));
-   uint64_t key = N(account);
-   share_type balance = 0;
-   context.front_record<key_value_index, by_scope_primary>(t_id, &key, (char *)&balance, sizeof(balance));
-
-   balance += amt;
-
-   context.store_record<key_value_object>(t_id, config::system_account_name, &key, (const char *)&balance, sizeof(balance));
-}
-
 
 void validate_authority_precondition( const apply_context& context, const authority& auth ) {
    for(const auto& a : auth.accounts) {
       context.db.get<account_object, by_name>(a.permission.actor);
-      context.db.find<permission_object, by_owner>(boost::make_tuple(a.permission.actor, a.permission.permission));
+      context.db.get<permission_object, by_owner>(boost::make_tuple(a.permission.actor, a.permission.permission));
    }
 }
 
 /**
  *  This method is called assuming precondition_system_newaccount succeeds a
  */
-void apply_eosio_newaccount(apply_context& context) { 
-   auto create = context.act.as<newaccount>();
+void apply_eosio_newaccount(apply_context& context) {
+   auto create = context.act.data_as<newaccount>();
    try {
    context.require_authorization(create.creator);
    context.require_write_lock( config::eosio_auth_scope );
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
 
    EOS_ASSERT( validate(create.owner), action_validate_exception, "Invalid owner authority");
    EOS_ASSERT( validate(create.active), action_validate_exception, "Invalid active authority");
    EOS_ASSERT( validate(create.recovery), action_validate_exception, "Invalid recovery authority");
 
    auto& db = context.mutable_db;
+
+   auto name_str = name(create.name).to_string();
+
+   EOS_ASSERT( !create.name.empty(), action_validate_exception, "account name cannot be empty" );
+   EOS_ASSERT( name_str.size() <= 12, action_validate_exception, "account names can only be 12 chars long" );
+
+   // Check if the creator is privileged
+   const auto &creator = db.get<account_object, by_name>(create.creator);
+   if( !creator.privileged ) {
+      EOS_ASSERT( name_str.find( "eosio." ) != 0, action_validate_exception,
+                  "only privileged accounts can have names that start with 'eosio.'" );
+   }
 
    auto existing_account = db.find<account_object, by_name>(create.name);
    EOS_ASSERT(existing_account == nullptr, action_validate_exception,
@@ -86,59 +74,82 @@ void apply_eosio_newaccount(apply_context& context) {
       a.name = create.name;
       a.creation_date = context.controller.head_block_time();
    });
+   resources.initialize_account(create.name);
+   resources.add_pending_account_ram_usage(
+      create.creator,
+      (int64_t)config::overhead_per_account_ram_bytes
+   );
 
-   auto create_permission = [owner=create.name, &db, &context](const permission_name& name, permission_object::id_type parent, authority &&auth) {
-      return db.create<permission_object>([&](permission_object& p) {
+   auto create_permission = [owner=create.name, &db, &context, &resources](const permission_name& name, permission_object::id_type parent, authority &&auth) {
+      const auto& result = db.create<permission_object>([&](permission_object& p) {
          p.name = name;
          p.parent = parent;
          p.owner = owner;
          p.auth = std::move(auth);
       });
+
+      resources.add_pending_account_ram_usage(
+         owner,
+         (int64_t)(config::billable_size_v<permission_object> + result.auth.get_billable_size())
+      );
+
+      return result;
    };
 
-   const auto& owner_permission = create_permission("owner", 0, std::move(create.owner));
-   create_permission("active", owner_permission.id, std::move(create.active));
-
-   db.create<bandwidth_usage_object>([&]( auto& bu ) { bu.owner = create.name; });
+   // If a parent_id of 0 is going to be used to indicate the absence of a parent, then we need to make sure that the chain
+   // initializes permission_index with a dummy object that reserves the id of 0.
+   const auto& owner_permission = create_permission(config::owner_name, 0, std::move(create.owner));
+   create_permission(config::active_name, owner_permission.id, std::move(create.active));
 
 } FC_CAPTURE_AND_RETHROW( (create) ) }
 
-
 void apply_eosio_setcode(apply_context& context) {
    auto& db = context.mutable_db;
-   auto  act = context.act.as<setcode>();
-
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
+   auto  act = context.act.data_as<setcode>();
    context.require_authorization(act.account);
    context.require_write_lock( config::eosio_auth_scope );
 
    FC_ASSERT( act.vmtype == 0 );
    FC_ASSERT( act.vmversion == 0 );
 
-   auto code_id = fc::sha256::hash( act.code.data(), act.code.size() );
+   auto code_id = fc::sha256::hash( act.code.data(), (uint32_t)act.code.size() );
 
-   // TODO: remove this compilation step in favor of validation without compilation
-   auto& code = context.mutable_controller.get_wasm_cache().checkout(code_id, act.code.data(), act.code.size());
-   context.mutable_controller.get_wasm_cache().checkin(code_id, code);
+   wasm_interface::validate(act.code);
 
    const auto& account = db.get<account_object,by_name>(act.account);
+
+   int64_t code_size = (int64_t)act.code.size();
+   int64_t old_size = (int64_t)account.code.size() * config::setcode_ram_bytes_multiplier;
+   int64_t new_size = code_size * config::setcode_ram_bytes_multiplier;
+
+
+   FC_ASSERT( account.code_version != code_id, "contract is already running this version of code" );
 //   wlog( "set code: ${size}", ("size",act.code.size()));
    db.modify( account, [&]( auto& a ) {
       /** TODO: consider whether a microsecond level local timestamp is sufficient to detect code version changes*/
-      #warning TODO: update setcode message to include the hash, then validate it in validate 
+      #warning TODO: update setcode message to include the hash, then validate it in validate
       a.code_version = code_id;
       // Added resize(0) here to avoid bug in boost vector container
       a.code.resize( 0 );
-      a.code.resize( act.code.size() );
+      a.code.resize( code_size );
       a.last_code_update = context.controller.head_block_time();
-      memcpy( a.code.data(), act.code.data(), act.code.size() );
+      memcpy( a.code.data(), act.code.data(), code_size );
 
    });
 
+   if (new_size != old_size) {
+      resources.add_pending_account_ram_usage(
+         act.account,
+         new_size - old_size
+      );
+   }
 }
 
 void apply_eosio_setabi(apply_context& context) {
    auto& db = context.mutable_db;
-   auto  act = context.act.as<setabi>();
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
+   auto  act = context.act.data_as<setabi>();
 
    context.require_authorization(act.account);
 
@@ -146,33 +157,48 @@ void apply_eosio_setabi(apply_context& context) {
    if ( act.account == eosio::chain::config::system_account_name ) {
       act.abi = chain_initializer::eos_contract_abi(act.abi);
    }
-
    /// if an ABI is specified make sure it is well formed and doesn't
    /// reference any undefined types
    abi_serializer(act.abi).validate();
    // todo: figure out abi serialization location
 
    const auto& account = db.get<account_object,by_name>(act.account);
+
+   int64_t old_size = (int64_t)account.abi.size();
+   int64_t new_size = (int64_t)fc::raw::pack_size(act.abi);
+
    db.modify( account, [&]( auto& a ) {
       a.set_abi( act.abi );
    });
+
+   if (new_size != old_size) {
+      resources.add_pending_account_ram_usage(
+         act.account,
+         new_size - old_size
+      );
+   }
 }
 
 void apply_eosio_updateauth(apply_context& context) {
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
    context.require_write_lock( config::eosio_auth_scope );
 
-   auto update = context.act.as<updateauth>();
+   auto& db = context.mutable_db;
+
+   auto update = context.act.data_as<updateauth>();
    EOS_ASSERT(!update.permission.empty(), action_validate_exception, "Cannot create authority with empty name");
-   EOS_ASSERT(update.permission != update.parent, action_validate_exception,
-              "Cannot set an authority as its own parent");
+   EOS_ASSERT( update.permission.to_string().find( "eosio." ) != 0, action_validate_exception,
+               "Permission names that start with 'eosio.' are reserved" );
+   EOS_ASSERT(update.permission != update.parent, action_validate_exception, "Cannot set an authority as its own parent");
+   db.get<account_object, by_name>(update.account);
    EOS_ASSERT(validate(update.data), action_validate_exception,
               "Invalid authority: ${auth}", ("auth", update.data));
-   if (update.permission == "active")
-      EOS_ASSERT(update.parent == "owner", action_validate_exception, "Cannot change active authority's parent from owner", ("update.parent", update.parent) );
-   if (update.permission == "owner")
+   if( update.permission == config::active_name )
+      EOS_ASSERT(update.parent == config::owner_name, action_validate_exception, "Cannot change active authority's parent from owner", ("update.parent", update.parent) );
+   if (update.permission == config::owner_name)
       EOS_ASSERT(update.parent.empty(), action_validate_exception, "Cannot change owner authority's parent");
-
-   auto& db = context.mutable_db;
+   else
+      EOS_ASSERT(!update.parent.empty(), action_validate_exception, "Only owner permission can have empty parent" );
 
    FC_ASSERT(context.act.authorization.size(), "updateauth can only have one action authorization");
    const auto& act_auth = context.act.authorization.front();
@@ -186,7 +212,7 @@ void apply_eosio_updateauth(apply_context& context) {
       if (current == nullptr) current = db.find<permission_object, by_owner>(boost::make_tuple(update.account, update.parent));
       // Ensure either the permission or parent's permission exists
       EOS_ASSERT(current != nullptr, permission_query_exception,
-                 "Fail to retrieve permission for: {\"actor\": \"${actor}\", \"permission\": \"${permission}\" }",
+                 "Failed to retrieve permission for: {\"actor\": \"${actor}\", \"permission\": \"${permission}\" }",
                  ("actor", update.account)("permission", update.parent));
 
       while(current->name != config::owner_name) {
@@ -201,13 +227,14 @@ void apply_eosio_updateauth(apply_context& context) {
 
    FC_ASSERT(act_auth.actor == update.account && permission_is_valid_for_update(), "updateauth must carry a permission equal to or in the ancestery of permission it updates");
 
-   db.get<account_object, by_name>(update.account);
    validate_authority_precondition(context, update.data);
 
    auto permission = db.find<permission_object, by_owner>(boost::make_tuple(update.account, update.permission));
-   
+
+   // If a parent_id of 0 is going to be used to indicate the absence of a parent, then we need to make sure that the chain
+   // initializes permission_index with a dummy object that reserves the id of 0.
    permission_object::id_type parent_id = 0;
-   if(update.permission != "owner") {
+   if(update.permission != config::owner_name) {
       auto& parent = db.get<permission_object, by_owner>(boost::make_tuple(update.account, update.parent));
       parent_id = parent.id;
    }
@@ -215,34 +242,57 @@ void apply_eosio_updateauth(apply_context& context) {
    if (permission) {
       EOS_ASSERT(parent_id == permission->parent, action_validate_exception,
                  "Changing parent authority is not currently supported");
-   
+
+
+      int64_t old_size = (int64_t)(config::billable_size_v<permission_object> + permission->auth.get_billable_size());
+
       // TODO/QUESTION: If we are updating an existing permission, should we check if the message declared
       // permission satisfies the permission we want to modify?
       db.modify(*permission, [&update, &parent_id, &context](permission_object& po) {
          po.auth = update.data;
          po.parent = parent_id;
          po.last_updated = context.controller.head_block_time();
+         po.delay = fc::seconds(update.delay);
       });
-   }  else {
+
+      int64_t new_size = (int64_t)(config::billable_size_v<permission_object> + permission->auth.get_billable_size());
+
+      resources.add_pending_account_ram_usage(
+         permission->owner,
+         new_size - old_size
+      );
+   } else {
       // TODO/QUESTION: If we are creating a new permission, should we check if the message declared
       // permission satisfies the parent permission?
-      db.create<permission_object>([&update, &parent_id, &context](permission_object& po) {
+      const auto& p = db.create<permission_object>([&update, &parent_id, &context](permission_object& po) {
          po.name = update.permission;
          po.owner = update.account;
          po.auth = update.data;
          po.parent = parent_id;
          po.last_updated = context.controller.head_block_time();
+         po.delay = fc::seconds(update.delay);
       });
+
+      resources.add_pending_account_ram_usage(
+         p.owner,
+         (int64_t)(config::billable_size_v<permission_object> + p.auth.get_billable_size())
+      );
+
    }
 }
 
 void apply_eosio_deleteauth(apply_context& context) {
-   auto remove = context.act.as<deleteauth>();
-   EOS_ASSERT(remove.permission != "active", action_validate_exception, "Cannot delete active authority");
-   EOS_ASSERT(remove.permission != "owner", action_validate_exception, "Cannot delete owner authority");
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
+   auto remove = context.act.data_as<deleteauth>();
+   EOS_ASSERT(remove.permission != config::active_name, action_validate_exception, "Cannot delete active authority");
+   EOS_ASSERT(remove.permission != config::owner_name, action_validate_exception, "Cannot delete owner authority");
 
    auto& db = context.mutable_db;
    context.require_authorization(remove.account);
+   // TODO/QUESTION:
+   //   Inconsistency between permissions that can be satisfied to create/modify (via updateauth) a permission and the
+   //   stricter requirements for deleting the permission using deleteauth.
+   //   If a permission can be updated, shouldn't it also be allowed to delete it without higher permissions required?
    const auto& permission = db.get<permission_object, by_owner>(boost::make_tuple(remove.account, remove.permission));
 
    { // Check for children
@@ -259,54 +309,80 @@ void apply_eosio_deleteauth(apply_context& context) {
                  "Cannot delete a linked authority. Unlink the authority first");
    }
 
+   resources.add_pending_account_ram_usage(
+      permission.owner,
+      -(int64_t)(config::billable_size_v<permission_object> + permission.auth.get_billable_size())
+   );
    db.remove(permission);
 }
 
 void apply_eosio_linkauth(apply_context& context) {
-   auto requirement = context.act.as<linkauth>();
-   EOS_ASSERT(!requirement.requirement.empty(), action_validate_exception, "Required permission cannot be empty");
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
+   auto requirement = context.act.data_as<linkauth>();
+   try {
+      EOS_ASSERT(!requirement.requirement.empty(), action_validate_exception, "Required permission cannot be empty");
 
-   context.require_authorization(requirement.account);
-   
-   auto& db = context.mutable_db;
-   db.get<account_object, by_name>(requirement.account);
-   db.get<account_object, by_name>(requirement.code);
-   db.get<permission_object, by_name>(requirement.requirement);
-   
-   auto link_key = boost::make_tuple(requirement.account, requirement.code, requirement.type);
-   auto link = db.find<permission_link_object, by_action_name>(link_key);
-   
-   if (link) {
-      EOS_ASSERT(link->required_permission != requirement.requirement, action_validate_exception,
-                 "Attempting to update required authority, but new requirement is same as old");
-      db.modify(*link, [requirement = requirement.requirement](permission_link_object& link) {
-          link.required_permission = requirement;
-      });
-   } else {
-      db.create<permission_link_object>([&requirement](permission_link_object& link) {
-         link.account = requirement.account;
-         link.code = requirement.code;
-         link.message_type = requirement.type;
-         link.required_permission = requirement.requirement;
-      });
-   }
+      context.require_authorization(requirement.account);
+
+      auto& db = context.mutable_db;
+      const auto *account = db.find<account_object, by_name>(requirement.account);
+      EOS_ASSERT(account != nullptr, account_query_exception,
+                 "Failed to retrieve account: ${account}", ("account", requirement.account)); // Redundant?
+      const auto *code = db.find<account_object, by_name>(requirement.code);
+      EOS_ASSERT(code != nullptr, account_query_exception,
+                 "Failed to retrieve code for account: ${account}", ("account", requirement.code));
+      if( requirement.requirement != config::eosio_any_name ) {
+         const auto *permission = db.find<permission_object, by_name>(requirement.requirement);
+         EOS_ASSERT(permission != nullptr, permission_query_exception,
+                    "Failed to retrieve permission: ${permission}", ("permission", requirement.requirement));
+      }
+
+      auto link_key = boost::make_tuple(requirement.account, requirement.code, requirement.type);
+      auto link = db.find<permission_link_object, by_action_name>(link_key);
+
+      if( link ) {
+         EOS_ASSERT(link->required_permission != requirement.requirement, action_validate_exception,
+                    "Attempting to update required authority, but new requirement is same as old");
+         db.modify(*link, [requirement = requirement.requirement](permission_link_object& link) {
+             link.required_permission = requirement;
+         });
+      } else {
+         const auto& l =  db.create<permission_link_object>([&requirement](permission_link_object& link) {
+            link.account = requirement.account;
+            link.code = requirement.code;
+            link.message_type = requirement.type;
+            link.required_permission = requirement.requirement;
+         });
+
+         resources.add_pending_account_ram_usage(
+            l.account,
+            (int64_t)(config::billable_size_v<permission_link_object>)
+         );
+      }
+  } FC_CAPTURE_AND_RETHROW((requirement))
 }
 
 void apply_eosio_unlinkauth(apply_context& context) {
+   auto& resources = context.mutable_controller.get_mutable_resource_limits_manager();
    auto& db = context.mutable_db;
-   auto unlink = context.act.as<unlinkauth>();
+   auto unlink = context.act.data_as<unlinkauth>();
 
    context.require_authorization(unlink.account);
 
    auto link_key = boost::make_tuple(unlink.account, unlink.code, unlink.type);
    auto link = db.find<permission_link_object, by_action_name>(link_key);
    EOS_ASSERT(link != nullptr, action_validate_exception, "Attempting to unlink authority, but no link found");
+   resources.add_pending_account_ram_usage(
+      link->account,
+      -(int64_t)(config::billable_size_v<permission_link_object>)
+   );
+
    db.remove(*link);
 }
 
 
 void apply_eosio_onerror(apply_context& context) {
-   assert(context.trx_meta.sender);
+   FC_ASSERT(context.trx_meta.sender.valid(), "onerror action cannot be called directly");
    context.require_recipient(*context.trx_meta.sender);
 }
 
@@ -320,35 +396,20 @@ static const abi_serializer& get_abi_serializer() {
 }
 
 static optional<variant> get_pending_recovery(apply_context& context, account_name account ) {
-   const auto* t_id = context.find_table(config::system_account_name, account, N(recovery));
-   if (t_id) {
-      uint64_t key = account;
-      int32_t record_size = context.front_record<key_value_index, by_scope_primary>(*t_id, &key, nullptr, 0);
-      if (record_size > 0) {
-         bytes value(record_size + sizeof(uint64_t));
-         uint64_t* key_p = reinterpret_cast<uint64_t *>(value.data());
-         *key_p = key;
+   const uint64_t id = account;
+   const auto table = N(recovery);
+   const auto iter = context.db_find_i64(config::system_account_name, account, table, id);
+   if (iter != -1) {
+      const auto buffer_size = context.db_get_i64(iter, nullptr, 0);
+      bytes value(buffer_size);
 
-         record_size = context.front_record<key_value_index, by_scope_primary>(*t_id, &key, value.data() + sizeof(uint64_t), value.size() - sizeof(uint64_t));
-         assert(record_size == value.size() - sizeof(uint64_t));
+      const auto written_size = context.db_get_i64(iter, value.data(), buffer_size);
+      assert(written_size == buffer_size);
 
-         return get_abi_serializer().binary_to_variant("pending_recovery", value);
-      }
+      return get_abi_serializer().binary_to_variant("pending_recovery", value);
    }
 
    return optional<variant_object>();
-}
-
-static uint32_t get_next_sender_id(apply_context& context) {
-   context.require_write_lock( config::eosio_auth_scope );
-   const auto& t_id = context.find_or_create_table(config::system_account_name, config::eosio_auth_scope, N(deferred.seq));
-   uint64_t key = N(config::eosio_auth_scope);
-   uint32_t next_serial = 0;
-   context.front_record<key_value_index, by_scope_primary>(t_id, &key, (char *)&next_serial, sizeof(uint32_t));
-
-   uint32_t result = next_serial++;
-   context.store_record<key_value_object>(t_id, config::system_account_name, &key, (char *)&next_serial, sizeof(uint32_t));
-   return result;
 }
 
 static auto get_account_creation(const apply_context& context, const account_name& account) {
@@ -370,7 +431,7 @@ void apply_eosio_postrecovery(apply_context& context) {
 
    FC_ASSERT(context.act.authorization.size() == 1, "Recovery Message must have exactly one authorization");
 
-   auto recover_act = context.act.as<postrecovery>();
+   auto recover_act = context.act.data_as<postrecovery>();
    const auto &auth = context.act.authorization.front();
    const auto& account = recover_act.account;
    context.require_write_lock(account);
@@ -413,8 +474,7 @@ void apply_eosio_postrecovery(apply_context& context) {
       .data = recover_act.data
    }, update);
 
-   uint32_t request_id = get_next_sender_id(context);
-
+   const uint128_t request_id = context.controller.transaction_id_to_sender_id(context.trx_meta.id);
    auto record_data = mutable_variant_object()
       ("account", account)
       ("request_id", request_id)
@@ -422,9 +482,10 @@ void apply_eosio_postrecovery(apply_context& context) {
       ("memo", recover_act.memo);
 
    deferred_transaction dtrx;
-   dtrx.sender = config::system_account_name;
+   dtrx.sender    = config::system_account_name;
    dtrx.sender_id = request_id;
-   dtrx.region = 0;
+   dtrx.payer     = config::system_account_name; // NOTE: we pre-reserve capacity for this during create account
+   dtrx.region    = 0;
    dtrx.execute_after = context.controller.head_block_time() + delay_lock;
    dtrx.set_reference_block(context.controller.head_block_id());
    dtrx.expiration = dtrx.execute_after + fc::seconds(60);
@@ -433,21 +494,30 @@ void apply_eosio_postrecovery(apply_context& context) {
 
    context.execute_deferred(std::move(dtrx));
 
-
-   const auto& t_id = context.find_or_create_table(config::system_account_name, account, N(recovery));
    auto data = get_abi_serializer().variant_to_binary("pending_recovery", record_data);
-   context.store_record<key_value_object>(t_id, 0, &account.value, data.data() + sizeof(uint64_t), data.size() - sizeof(uint64_t));
+   const uint64_t id = account;
+   const uint64_t table = N(recovery);
+   const auto payer = account;
+
+   const auto iter = context.db_find_i64(config::system_account_name, account, table, id);
+   if (iter == -1) {
+      context.db_store_i64(account, table, payer, id, (const char*)data.data(), data.size());
+   } else {
+      context.db_update_i64(iter, payer, (const char*)data.data(), data.size());
+   }
 
    context.console_append_formatted("Recovery Started for account ${account} : ${memo}\n", mutable_variant_object()("account", account)("memo", recover_act.memo));
 }
 
 static void remove_pending_recovery(apply_context& context, const account_name& account) {
-   const auto& t_id = context.find_or_create_table(config::system_account_name, account, N(recovery));
-   context.remove_record<key_value_object>(t_id, &account.value);
+   const auto iter = context.db_find_i64(config::system_account_name, account, N(recovery), account);
+   if (iter != -1) {
+      context.db_remove_i64(iter);
+   }
 }
 
 void apply_eosio_passrecovery(apply_context& context) {
-   auto pass_act = context.act.as<passrecovery>();
+   auto pass_act = context.act.data_as<passrecovery>();
    const auto& account = pass_act.account;
 
    // ensure this is only processed if it is a deferred transaction from the system account
@@ -465,12 +535,12 @@ void apply_eosio_passrecovery(apply_context& context) {
    context.execute_inline(move(act));
 
    remove_pending_recovery(context, account);
-   context.console_append_formatted("Account ${account} successfully recoverd!\n", mutable_variant_object()("account", account));
+   context.console_append_formatted("Account ${account} successfully recovered!\n", mutable_variant_object()("account", account));
 }
 
 void apply_eosio_vetorecovery(apply_context& context) {
    context.require_write_lock( config::eosio_auth_scope );
-   auto pass_act = context.act.as<vetorecovery>();
+   auto pass_act = context.act.data_as<vetorecovery>();
    const auto& account = pass_act.account;
    context.require_authorization(account);
 
@@ -478,11 +548,42 @@ void apply_eosio_vetorecovery(apply_context& context) {
    FC_ASSERT(maybe_recovery, "No pending recovery found for account ${account}", ("account", account));
    auto recovery = *maybe_recovery;
 
-   context.cancel_deferred(recovery["request_id"].as<uint32_t>());
+   context.cancel_deferred(recovery["request_id"].as<uint128_t>());
 
    remove_pending_recovery(context, account);
    context.console_append_formatted("Recovery for account ${account} vetoed!\n", mutable_variant_object()("account", account));
 }
 
+void apply_eosio_canceldelay(apply_context& context) {
+   auto cancel = context.act.data_as<canceldelay>();
+   const auto& trx_id = cancel.trx_id;
+
+   const auto& generated_transaction_idx = context.controller.get_database().get_index<generated_transaction_multi_index>();
+   const auto& generated_index = generated_transaction_idx.indices().get<by_trx_id>();
+   const auto& itr = generated_index.lower_bound(trx_id);
+   FC_ASSERT (itr != generated_index.end() && itr->sender == config::system_account_name && itr->trx_id == trx_id,
+              "cannot cancel trx_id=${tid}, there is no deferred transaction with that transaction id",("tid", trx_id));
+
+   auto dtrx = fc::raw::unpack<deferred_transaction>(itr->packed_trx.data(), itr->packed_trx.size());
+   set<account_name> accounts;
+   for (const auto& act : dtrx.actions) {
+      for (const auto& auth : act.authorization) {
+         accounts.insert(auth.actor);
+      }
+   }
+
+   bool found = false;
+   for (const auto& auth : context.act.authorization) {
+      if (auth.permission == config::active_name && accounts.count(auth.actor)) {
+         found = true;
+         break;
+      }
+   }
+
+   FC_ASSERT (found, "canceldelay action must be signed with the \"active\" permission for one of the actors"
+                     " provided in the authorizations on the original transaction");
+
+   context.cancel_deferred(context.controller.transaction_id_to_sender_id(trx_id));
+}
 
 } } } // namespace eosio::chain::contracts

@@ -4,8 +4,10 @@
  */
 #pragma once
 #include <eosiolib/types.h>
+#include <functional>
+#include <tuple>
 
-namespace  eosio {
+namespace eosio {
 
    /**
     *  @brief Converts a base32 symbol into its binary representation, used by string_to_name()
@@ -71,22 +73,31 @@ namespace  eosio {
     *  @{
     */
    struct name {
-      name( uint64_t v = 0 ): value(v) {}
       operator uint64_t()const { return value; }
 
       friend bool operator==( const name& a, const name& b ) { return a.value == b.value; }
       account_name value = 0;
-
-
-      template<typename DataStream>
-      friend DataStream& operator << ( DataStream& ds, const name& v ){
-         return ds << v.value;
-      }
-      template<typename DataStream>
-      friend DataStream& operator >> ( DataStream& ds, name& v ){
-         return ds >> v.value;
-      }
    };
    /// @}
 
-} // namespace eos
+} // namespace eosio
+
+namespace std {
+   /**
+    * @brief provide less for checksum256
+    */
+   template<>
+   struct less<checksum256> : binary_function<checksum256, checksum256, bool> {
+      bool operator()( const checksum256& lhs, const checksum256& rhs ) const {
+         return memcmp(&lhs, &rhs, sizeof(lhs)) < 0;
+      }
+   };
+
+} // namespace std
+
+/**
+ * Provide == for checksum256 in global namespace
+ */
+bool operator==(const checksum256& lhs, const checksum256& rhs) {
+   return memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
+}

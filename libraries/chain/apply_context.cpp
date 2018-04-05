@@ -11,23 +11,22 @@ using boost::container::flat_set;
 namespace eosio { namespace chain {
 void apply_context::exec_one()
 {
+   auto start = fc::time_point::now();
+   _cpu_usage = 0;
    try {
+      const auto &a = mutable_controller.get_database().get<account_object, by_name>(receiver);
+      privileged = a.privileged;
       auto native = mutable_controller.find_apply_handler(receiver, act.account, act.name);
       if (native) {
          (*native)(*this);
-      } else {
-         const auto &a = mutable_controller.get_database().get<account_object, by_name>(receiver);
-         privileged = a.privileged;
+      }
 
-         if (a.code.size() > 0) {
-            // get code from cache
-            auto code = mutable_controller.get_wasm_cache().checkout_scoped(a.code_version, a.code.data(),
-                                                                            a.code.size());
-            // get wasm_interface
-            auto &wasm = wasm_interface::get();
-            wasm.apply(code, *this);
+      if (a.code.size() > 0 && !(act.name == N(setcode) && act.account == config::system_account_name)) {
+         try {
+            mutable_controller.get_wasm_interface().apply(a.code_version, a.code, *this);
+         } catch ( const wasm_exit& ){}
       }
-      }
+
    } FC_CAPTURE_AND_RETHROW((_pending_console_output.str()));
 
    if (!_write_scopes.empty()) {
@@ -85,10 +84,11 @@ void apply_context::exec_one()
       }
    }
 
-   results.applied_actions.emplace_back(action_trace {receiver, act, _pending_console_output.str(), 0, 0, move(data_access)});
+   results.applied_actions.emplace_back(action_trace {receiver, context_free, _cpu_usage, act, _pending_console_output.str(), move(data_access)});
    _pending_console_output = std::ostringstream();
    _read_locks.clear();
    _write_scopes.clear();
+   results.applied_actions.back()._profiling_us = fc::time_point::now() - start;
 }
 
 void apply_context::exec()
@@ -97,6 +97,14 @@ void apply_context::exec()
    for( uint32_t i = 0; i < _notified.size(); ++i ) {
       receiver = _notified[i];
       exec_one();
+   }
+
+   for( uint32_t i = 0; i < _cfa_inline_actions.size(); ++i ) {
+      EOS_ASSERT( recurse_depth < config::max_recursion_depth, transaction_exception, "inline action recursion depth reached" );
+      apply_context ncontext( mutable_controller, mutable_db, _cfa_inline_actions[i], trx_meta, recurse_depth + 1 );
+      ncontext.context_free = true;
+      ncontext.exec();
+      append_results(move(ncontext.results));
    }
 
    for( uint32_t i = 0; i < _inline_actions.size(); ++i ) {
@@ -112,17 +120,47 @@ bool apply_context::is_account( const account_name& account )const {
    return nullptr != db.find<account_object,by_name>( account );
 }
 
-void apply_context::require_authorization( const account_name& account )const {
-  for( const auto& auth : act.authorization )
-     if( auth.actor == account ) return;
-  wdump((act));
-  EOS_ASSERT( false, tx_missing_auth, "missing authority of ${account}", ("account",account));
+bool apply_context::all_authorizations_used()const {
+   for ( bool has_auth : used_authorizations ) {
+      if ( !has_auth )
+         return false;
+   }
+   return true;
 }
+
+vector<permission_level> apply_context::unused_authorizations()const {
+   vector<permission_level> ret_auths;
+   for ( uint32_t i=0; i < act.authorization.size(); i++ )
+      if ( !used_authorizations[i] )
+         ret_auths.push_back( act.authorization[i] );
+   return ret_auths;
+}
+
+void apply_context::require_authorization( const account_name& account ) {
+   for( uint32_t i=0; i < act.authorization.size(); i++ ) {
+     if( act.authorization[i].actor == account ) {
+        used_authorizations[i] = true;
+        return;
+     }
+   }
+   EOS_ASSERT( false, tx_missing_auth, "missing authority of ${account}", ("account",account));
+}
+
+bool apply_context::has_authorization( const account_name& account )const {
+   for( const auto& auth : act.authorization )
+     if( auth.actor == account )
+        return true;
+  return false;
+}
+
 void apply_context::require_authorization(const account_name& account,
-                                          const permission_name& permission)const {
-  for( const auto& auth : act.authorization )
-     if( auth.actor == account ) {
-        if( auth.permission == permission ) return;
+                                          const permission_name& permission) {
+  for( uint32_t i=0; i < act.authorization.size(); i++ )
+     if( act.authorization[i].actor == account ) {
+        if( act.authorization[i].permission == permission ) {
+           used_authorizations[i] = true;
+           return;
+        }
      }
   EOS_ASSERT( false, tx_missing_auth, "missing authority of ${account}/${permission}",
               ("account",account)("permission",permission) );
@@ -172,41 +210,105 @@ void apply_context::require_recipient( account_name code ) {
       _notified.push_back(code);
 }
 
-void apply_context::execute_inline( action &&a ) {
-   // todo: rethink this special case
-   if (receiver != config::system_account_name) {
-      controller.check_authorization({a}, flat_set<public_key_type>(), false, {receiver});
+
+/**
+ *  This will execute an action after checking the authorization. Inline transactions are
+ *  implicitly authorized by the current receiver (running code). This method has significant
+ *  security considerations and several options have been considered:
+ *
+ *  1. priviledged accounts (those marked as such by block producers) can authorize any action
+ *  2. all other actions are only authorized by 'receiver' which means the following:
+ *         a. the user must set permissions on their account to allow the 'receiver' to act on their behalf
+ *
+ *  Discarded Implemenation:  at one point we allowed any account that authorized the current transaction
+ *   to implicitly authorize an inline transaction. This approach would allow privelege escalation and
+ *   make it unsafe for users to interact with certain contracts.  We opted instead to have applications
+ *   ask the user for permission to take certain actions rather than making it implicit. This way users
+ *   can better understand the security risk.
+ */
+void apply_context::execute_inline( action&& a ) {
+   if ( !privileged ) {
+      if( a.account != receiver ) {
+         const auto delay = controller.check_authorization({a}, flat_set<public_key_type>(), false, {receiver});
+         FC_ASSERT( trx_meta.published + delay <= controller.head_block_time(),
+                    "inline action uses a permission that imposes a delay that is not met, set delay_sec in transaction header to at least ${delay} seconds",
+                    ("delay", delay.to_seconds()) );
+      }
    }
    _inline_actions.emplace_back( move(a) );
 }
 
+void apply_context::execute_context_free_inline( action&& a ) {
+   FC_ASSERT( a.authorization.size() == 0, "context free actions cannot have authorizations" );
+   _cfa_inline_actions.emplace_back( move(a) );
+}
+
 void apply_context::execute_deferred( deferred_transaction&& trx ) {
    try {
-      FC_ASSERT( trx.expiration > (controller.head_block_time() + fc::milliseconds(2*config::block_interval_ms)),
-                                   "transaction is expired when created" );
+      trx.set_reference_block(controller.head_block_id()); // No TaPoS check necessary
+      trx.sender = receiver;
+      controller.validate_transaction_without_state(trx);
+      // transaction_api::send_deferred guarantees that trx.execute_after is at least head block time, so no need to check expiration.
+      // Any other called of this function needs to similarly meet that precondition.
+      EOS_ASSERT( trx.execute_after < trx.expiration,
+                  transaction_exception,
+                  "Transaction expires at ${trx.expiration} which is before the first allowed time to execute at ${trx.execute_after}",
+                  ("trx.expiration",trx.expiration)("trx.execute_after",trx.execute_after) );
 
-      FC_ASSERT( trx.execute_after < trx.expiration, "transaction expires before it can execute" );
+      controller.validate_expiration_not_too_far(trx, trx.execute_after);
+      controller.validate_referenced_accounts(trx);
 
-      /// TODO: make default_max_gen_trx_count a producer parameter
-      FC_ASSERT( results.generated_transactions.size() < config::default_max_gen_trx_count );
+      controller.validate_uniqueness(trx); // TODO: Move this out of here when we have concurrent shards to somewhere we can check for conflicts between shards.
 
-      FC_ASSERT( !trx.actions.empty(), "transaction must have at least one action");
+      const auto& gpo = controller.get_global_properties();
+      FC_ASSERT( results.deferred_transactions_count < gpo.configuration.max_generated_transaction_count );
 
-      // todo: rethink this special case
-      if (receiver != config::system_account_name) {
-         controller.check_authorization(trx.actions, flat_set<public_key_type>(), false, {receiver});
+      fc::microseconds delay;
+
+      // privileged accounts can do anything, no need to check auth
+      if( !privileged ) {
+         // check to make sure the payer has authorized this deferred transaction's storage in RAM
+         if (trx.payer != receiver) {
+            require_authorization(trx.payer);
+         }
+
+         if (trx.payer != receiver) {
+            require_authorization(trx.payer);
+         }
+
+         // if a contract is deferring only actions to itself then there is no need
+         // to check permissions, it could have done everything anyway.
+         bool check_auth = false;
+         for( const auto& act : trx.actions ) {
+            if( act.account != receiver ) {
+               check_auth = true;
+               break;
+            }
+         }
+         if( check_auth ) {
+            delay = controller.check_authorization(trx.actions, flat_set<public_key_type>(), false, {receiver});
+            FC_ASSERT( trx_meta.published + delay <= controller.head_block_time(),
+                       "deferred transaction uses a permission that imposes a delay that is not met, set delay_sec in transaction header to at least ${delay} seconds",
+                       ("delay", delay.to_seconds()) );
+         }
       }
 
-      trx.sender = receiver; //  "Attempting to send from another account"
-      trx.set_reference_block(controller.head_block_id());
+      auto now = controller.head_block_time();
+      if( delay.count() ) {
+         auto min_execute_after_time = time_point_sec(now + delay + fc::microseconds(999'999)); // rounds up nearest second
+         EOS_ASSERT( min_execute_after_time <= trx.execute_after,
+                     transaction_exception,
+                     "deferred transaction is specified to execute after ${trx.execute_after} which is earlier than the earliest time allowed by authorization checker",
+                     ("trx.execute_after",trx.execute_after)("min_execute_after_time",min_execute_after_time) );
+      }
 
-      /// TODO: make sure there isn't already a deferred transaction with this ID or senderID?
-      results.generated_transactions.emplace_back(move(trx));
+      results.deferred_transaction_requests.push_back(move(trx));
+      results.deferred_transactions_count++;
    } FC_CAPTURE_AND_RETHROW((trx));
 }
 
-void apply_context::cancel_deferred( uint32_t sender_id ) {
-   results.canceled_deferred.emplace_back(receiver, sender_id);
+void apply_context::cancel_deferred( const uint128_t& sender_id ) {
+   results.deferred_transaction_requests.push_back(deferred_reference(receiver, sender_id));
 }
 
 const contracts::table_id_object* apply_context::find_table( name code, name scope, name table ) {
@@ -214,7 +316,7 @@ const contracts::table_id_object* apply_context::find_table( name code, name sco
    return db.find<table_id_object, contracts::by_code_scope_table>(boost::make_tuple(code, scope, table));
 }
 
-const contracts::table_id_object& apply_context::find_or_create_table( name code, name scope, name table ) {
+const contracts::table_id_object& apply_context::find_or_create_table( name code, name scope, name table, const account_name &payer ) {
    require_read_lock(code, scope);
    const auto* existing_tid =  db.find<contracts::table_id_object, contracts::by_code_scope_table>(boost::make_tuple(code, scope, table));
    if (existing_tid != nullptr) {
@@ -222,11 +324,20 @@ const contracts::table_id_object& apply_context::find_or_create_table( name code
    }
 
    require_write_lock(scope);
+
+   update_db_usage(payer, config::billable_size_v<contracts::table_id_object>);
+
    return mutable_db.create<contracts::table_id_object>([&](contracts::table_id_object &t_id){
       t_id.code = code;
       t_id.scope = scope;
       t_id.table = table;
+      t_id.payer = payer;
    });
+}
+
+void apply_context::remove_table( const contracts::table_id_object& tid ) {
+   update_db_usage(tid.payer, - config::billable_size_v<contracts::table_id_object>);
+   mutable_db.remove(tid);
 }
 
 vector<account_name> apply_context::get_active_producers() const {
@@ -238,10 +349,11 @@ vector<account_name> apply_context::get_active_producers() const {
    return accounts;
 }
 
-void apply_context::checktime(uint32_t instruction_count) const {
+void apply_context::checktime(uint32_t instruction_count) {
    if (trx_meta.processing_deadline && fc::time_point::now() > (*trx_meta.processing_deadline)) {
       throw checktime_exceeded();
    }
+   _cpu_usage += instruction_count;
 }
 
 
@@ -260,46 +372,14 @@ const bytes& apply_context::get_packed_transaction() {
    return trx_meta.packed_trx;
 }
 
-const char* to_string(contracts::table_key_type key_type) {
-   switch(key_type) {
-   case contracts::type_unassigned:
-      return "unassigned";
-   case contracts::type_i64:
-      return "i64";
-   case contracts::type_str:
-      return "str";
-   case contracts::type_i128i128:
-      return "i128i128";
-   case contracts::type_i64i64:
-      return "i64i64";
-   case contracts::type_i64i64i64:
-      return "i64i64i64";
-   default:
-      return "<unkown table_key_type>";
-   }
-}
-
-void apply_context::validate_table_key( const table_id_object& t_id, contracts::table_key_type key_type ) {
-   FC_ASSERT( t_id.key_type == contracts::table_key_type::type_unassigned || key_type == t_id.key_type,
-              "Table entry for ${code}-${scope}-${table} uses key type ${act_type} should have had type of ${exp_type}",
-              ("code",t_id.code)("scope",t_id.scope)("table",t_id.table)("act_type",to_string(t_id.key_type))("exp_type", to_string(key_type)) );
-}
-
-void apply_context::validate_or_add_table_key( const table_id_object& t_id, contracts::table_key_type key_type ) {
-   if (t_id.key_type == contracts::table_key_type::type_unassigned)
-      mutable_db.modify( t_id, [&key_type]( auto& o) {
-         o.key_type = key_type;
-      });
-   else
-      FC_ASSERT( key_type == t_id.key_type,
-                 "Table entry for ${code}-${scope}-${table} uses key type ${act_type} should have had type of ${exp_type}",
-                 ("code",t_id.code)("scope",t_id.scope)("table",t_id.table)("act_type",to_string(t_id.key_type))("exp_type", to_string(key_type)) );
-}
-
 void apply_context::update_db_usage( const account_name& payer, int64_t delta ) {
    require_write_lock( payer );
-   if( (delta > 0) && payer != account_name(receiver) ) {
-      require_authorization( payer );
+   if( (delta > 0) ) {
+      if (!(privileged || payer == account_name(receiver))) {
+         require_authorization( payer );
+      }
+
+      mutable_controller.get_mutable_resource_limits_manager().add_pending_account_ram_usage(payer, delta);
    }
 }
 
@@ -318,6 +398,16 @@ int apply_context::get_action( uint32_t type, uint32_t index, char* buffer, size
          return -1;
       act = &trx.actions[index];
    }
+   else if( type == 2 ) {
+      if( index >= _cfa_inline_actions.size() )
+         return -1;
+      act = &_cfa_inline_actions[index];
+   }
+   else if( type == 3 ) {
+      if( index >= _inline_actions.size() )
+         return -1;
+      act = &_inline_actions[index];
+   }
 
    auto ps = fc::raw::pack_size( *act );
    if( ps <= buffer_size ) {
@@ -335,19 +425,29 @@ int apply_context::get_context_free_data( uint32_t index, char* buffer, size_t b
    if( buffer_size == 0 ) return s;
 
    if( buffer_size < s )
-      memcpy( buffer, trx_meta.context_free_data.data(), buffer_size );
+      memcpy( buffer, trx_meta.context_free_data[index].data(), buffer_size );
    else
-      memcpy( buffer, trx_meta.context_free_data.data(), s );
+      memcpy( buffer, trx_meta.context_free_data[index].data(), s );
 
    return s;
 }
 
+void apply_context::check_auth( const transaction& trx, const vector<permission_level>& perm ) {
+   controller.check_authorization( trx.actions,
+                                   {},
+                                   true,
+                                   {},
+                                   flat_set<permission_level>(perm.begin(), perm.end()) );
+}
 
 int apply_context::db_store_i64( uint64_t scope, uint64_t table, const account_name& payer, uint64_t id, const char* buffer, size_t buffer_size ) {
+   return db_store_i64( receiver, scope, table, payer, id, buffer, buffer_size);
+}
+
+int apply_context::db_store_i64( uint64_t code, uint64_t scope, uint64_t table, const account_name& payer, uint64_t id, const char* buffer, size_t buffer_size ) {
    require_write_lock( scope );
-   const auto& tab = find_or_create_table( receiver, scope, table );
+   const auto& tab = find_or_create_table( code, scope, table, payer );
    auto tableid = tab.id;
-   validate_or_add_table_key(tab, contracts::table_key_type::type_i64);
 
    FC_ASSERT( payer != account_name(), "must specify a valid account to pay for new record" );
 
@@ -363,7 +463,8 @@ int apply_context::db_store_i64( uint64_t scope, uint64_t table, const account_n
      ++t.count;
    });
 
-   update_db_usage( payer, buffer_size + 200 );
+   int64_t billable_size = (int64_t)(buffer_size + config::billable_size_v<key_value_object>);
+   update_db_usage( payer, billable_size);
 
    keyval_cache.cache_table( tab );
    return keyval_cache.add( obj );
@@ -372,17 +473,23 @@ int apply_context::db_store_i64( uint64_t scope, uint64_t table, const account_n
 void apply_context::db_update_i64( int iterator, account_name payer, const char* buffer, size_t buffer_size ) {
    const key_value_object& obj = keyval_cache.get( iterator );
 
-   require_write_lock( keyval_cache.get_table( obj.t_id ).scope );
+   const auto& tab = keyval_cache.get_table( obj.t_id );
+   require_write_lock( tab.scope );
 
-   int64_t old_size = obj.value.size();
+   const int64_t overhead = config::billable_size_v<key_value_object>;
+   int64_t old_size = (int64_t)(obj.value.size() + overhead);
+   int64_t new_size = (int64_t)(buffer_size + overhead);
 
    if( payer == account_name() ) payer = obj.payer;
 
-   if( account_name(obj.payer) == payer ) {
-      update_db_usage( obj.payer, buffer_size - old_size );
-   } else  {
-      update_db_usage( obj.payer,  -(old_size+200) );
-      update_db_usage( payer,  (buffer_size+200) );
+   if( account_name(obj.payer) != payer ) {
+      // refund the existing payer
+      update_db_usage( obj.payer,  -(old_size) );
+      // charge the new payer
+      update_db_usage( payer,  (new_size));
+   } else if(old_size != new_size) {
+      // charge/refund the existing payer the difference
+      update_db_usage( obj.payer, new_size - old_size);
    }
 
    mutable_db.modify( obj, [&]( auto& o ) {
@@ -394,7 +501,7 @@ void apply_context::db_update_i64( int iterator, account_name payer, const char*
 
 void apply_context::db_remove_i64( int iterator ) {
    const key_value_object& obj = keyval_cache.get( iterator );
-   update_db_usage( obj.payer,  -(obj.value.size()+200) );
+   update_db_usage( obj.payer,  -(obj.value.size() + config::billable_size_v<key_value_object>) );
 
    const auto& table_obj = keyval_cache.get_table( obj.t_id );
    require_write_lock( table_obj.scope );
@@ -403,6 +510,10 @@ void apply_context::db_remove_i64( int iterator ) {
       --t.count;
    });
    mutable_db.remove( obj );
+
+   if (table_obj.count == 0) {
+      remove_table(table_obj);
+   }
 
    keyval_cache.remove( iterator );
 }
@@ -466,7 +577,6 @@ int apply_context::db_find_i64( uint64_t code, uint64_t scope, uint64_t table, u
 
    const auto* tab = find_table( code, scope, table );
    if( !tab ) return -1;
-   validate_table_key(*tab, contracts::table_key_type::type_i64);
 
    auto table_end_itr = keyval_cache.cache_table( *tab );
 
@@ -481,7 +591,6 @@ int apply_context::db_lowerbound_i64( uint64_t code, uint64_t scope, uint64_t ta
 
    const auto* tab = find_table( code, scope, table );
    if( !tab ) return -1;
-   validate_table_key(*tab, contracts::table_key_type::type_i64);
 
    auto table_end_itr = keyval_cache.cache_table( *tab );
 
@@ -498,7 +607,6 @@ int apply_context::db_upperbound_i64( uint64_t code, uint64_t scope, uint64_t ta
 
    const auto* tab = find_table( code, scope, table );
    if( !tab ) return -1;
-   validate_table_key(*tab, contracts::table_key_type::type_i64);
 
    auto table_end_itr = keyval_cache.cache_table( *tab );
 
@@ -515,33 +623,7 @@ int apply_context::db_end_i64( uint64_t code, uint64_t scope, uint64_t table ) {
 
    const auto* tab = find_table( code, scope, table );
    if( !tab ) return -1;
-   validate_table_key(*tab, contracts::table_key_type::type_i64);
 
    return keyval_cache.cache_table( *tab );
-}
-
-template<>
-contracts::table_key_type apply_context::get_key_type<contracts::key_value_object>() {
-   return contracts::table_key_type::type_i64;
-}
-
-template<>
-contracts::table_key_type apply_context::get_key_type<contracts::keystr_value_object>() {
-   return contracts::table_key_type::type_str;
-}
-
-template<>
-contracts::table_key_type apply_context::get_key_type<contracts::key128x128_value_object>() {
-   return contracts::table_key_type::type_i128i128;
-}
-
-template<>
-contracts::table_key_type apply_context::get_key_type<contracts::key64x64_value_object>() {
-   return contracts::table_key_type::type_i64i64;
-}
-
-template<>
-contracts::table_key_type apply_context::get_key_type<contracts::key64x64x64_value_object>() {
-   return contracts::table_key_type::type_i64i64i64;
 }
 } } /// eosio::chain

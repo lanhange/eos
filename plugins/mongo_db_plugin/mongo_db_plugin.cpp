@@ -405,9 +405,7 @@ void mongo_db_plugin_impl::_process_block(const block_trace& bt, const signed_bl
                      kvp("transaction_id", trans_id_str),
                      kvp("receiver", act.receiver.to_string()),
                      kvp("action", b_oid{msg_oid}),
-                     kvp("console", act.console),
-                     kvp("region_id", b_int64{act.region_id}),
-                     kvp("cycle_index", b_int64{act.cycle_index}));
+                     kvp("console", act.console));
       act_doc.append(kvp("data_access", [&act](bsoncxx::builder::basic::sub_array subarr) {
          for (const auto& data : act.data_access) {
             subarr.append([&data](bsoncxx::builder::basic::sub_document subdoc) {
@@ -475,16 +473,26 @@ void mongo_db_plugin_impl::_process_block(const block_trace& bt, const signed_bl
                                         "unknown";
                trx_status_map[trx_trace.id] = trx_status;
                
-               for (const auto& trx : trx_trace.deferred_transactions) {
-                  auto doc = process_trx(trx);
-                  doc.append(kvp("type", "deferred"),
-                             kvp("sender_id", b_int64{trx.sender_id}),
-                             kvp("sender", trx.sender.to_string()),
-                             kvp("execute_after", b_date{std::chrono::milliseconds{
-                                   std::chrono::seconds{trx.execute_after.sec_since_epoch()}}}));
-                  mongocxx::model::insert_one insert_op{doc.view()};
-                  bulk_trans.append(insert_op);
-                  ++trx_num;
+               for (const auto& req : trx_trace.deferred_transaction_requests) {
+                  if ( req.contains<chain::deferred_transaction>() ) {
+                     auto trx = req.get<chain::deferred_transaction>();
+                     auto doc = process_trx(trx);
+                     doc.append(kvp("type", "deferred"),
+                                kvp("sender_id", b_int64{static_cast<int64_t>(trx.sender_id)}),
+                                kvp("sender", trx.sender.to_string()),
+                                kvp("execute_after", b_date{std::chrono::milliseconds{
+                                         std::chrono::seconds{trx.execute_after.sec_since_epoch()}}}));
+                     mongocxx::model::insert_one insert_op{doc.view()};
+                     bulk_trans.append(insert_op);
+                     ++trx_num;
+                  } else {
+                     auto cancel = req.get<chain::deferred_reference>();
+                     auto doc = bsoncxx::builder::basic::document{};
+                     doc.append(kvp("type", "cancel_deferred"),
+                                kvp("sender_id", b_int64{static_cast<int64_t>(cancel.sender_id)}),
+                                kvp("sender", cancel.sender.to_string())
+                     );
+                  }
                }
                if (!trx_trace.action_traces.empty()) {
                   actions_to_write = true;
@@ -517,6 +525,14 @@ void mongo_db_plugin_impl::_process_block(const block_trace& bt, const signed_bl
             subarr.append(fc::variant(sig).as_string());
          }
       }));
+      mongocxx::model::insert_one insert_op{doc.view()};
+      bulk_trans.append(insert_op);
+      ++trx_num;
+   }
+
+   for (const auto& implicit_trx : bt.implicit_transactions ){
+      auto doc = process_trx(implicit_trx);
+      doc.append(kvp("type", "implicit"));
       mongocxx::model::insert_one insert_op{doc.view()};
       bulk_trans.append(insert_op);
       ++trx_num;
@@ -650,7 +666,7 @@ void mongo_db_plugin_impl::update_account(const chain::action& msg) {
    } else if (msg.name == newaccount) {
       auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::microseconds{fc::time_point::now().time_since_epoch().count()});
-      auto newaccount = msg.as<chain::contracts::newaccount>();
+      auto newaccount = msg.data_as<chain::contracts::newaccount>();
 
       // create new account
       bsoncxx::builder::stream::document doc{};
@@ -667,7 +683,7 @@ void mongo_db_plugin_impl::update_account(const chain::action& msg) {
    } else if (msg.name == setabi) {
       auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::microseconds{fc::time_point::now().time_since_epoch().count()});
-      auto setabi = msg.as<chain::contracts::setabi>();
+      auto setabi = msg.data_as<chain::contracts::setabi>();
       auto from_account = find_account(accounts, setabi.account);
 
       document update_from{};
@@ -774,7 +790,7 @@ void mongo_db_plugin::set_program_options(options_description& cli, options_desc
 {
    cfg.add_options()
          ("mongodb-queue-size,q", bpo::value<uint>()->default_value(256),
-         "The queue size between eosiod and MongoDB plugin thread.")
+         "The queue size between nodeos and MongoDB plugin thread.")
          ("mongodb-uri,m", bpo::value<std::string>(),
          "MongoDB URI connection string, see: https://docs.mongodb.com/master/reference/connection-string/."
                " If not specified then plugin is disabled. Default database 'EOS' is used if not specified in URI.")

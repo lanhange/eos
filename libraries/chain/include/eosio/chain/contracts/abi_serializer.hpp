@@ -4,9 +4,8 @@
  */
 #pragma once
 #include <eosio/chain/contracts/types.hpp>
-#include <eosio/chain/transaction.hpp>
-#include <eosio/chain/block.hpp>
-
+#include <eosio/chain/block_trace.hpp>
+#include <eosio/chain/exceptions.hpp>
 #include <fc/variant_object.hpp>
 
 namespace eosio { namespace chain { namespace contracts {
@@ -31,9 +30,9 @@ struct abi_serializer {
    map<name,type_name>        actions;
    map<name,type_name>        tables;
 
-   typedef std::function<fc::variant(fc::datastream<const char*>&, bool)>  unpack_function;
-   typedef std::function<void(const fc::variant&, fc::datastream<char*>&, bool)>  pack_function;
-   
+   typedef std::function<fc::variant(fc::datastream<const char*>&, bool, bool)>  unpack_function;
+   typedef std::function<void(const fc::variant&, fc::datastream<char*>&, bool, bool)>  pack_function;
+
    map<type_name, pair<unpack_function, pack_function>> built_in_types;
    void configure_built_in_types();
 
@@ -42,12 +41,13 @@ struct abi_serializer {
 
    type_name resolve_type(const type_name& t)const;
    bool      is_array(const type_name& type)const;
+   bool      is_optional(const type_name& type)const;
    bool      is_type(const type_name& type)const;
    bool      is_builtin_type(const type_name& type)const;
    bool      is_integer(const type_name& type) const;
    int       get_integer_size(const type_name& type) const;
    bool      is_struct(const type_name& type)const;
-   type_name array_type(const type_name& type)const;
+   type_name fundamental_type(const type_name& type)const;
 
    const struct_def& get_struct(const type_name& type)const;
 
@@ -176,6 +176,12 @@ namespace impl {
          mvo(name, std::move(array));
       }
 
+      template<typename Resolver, typename... Args>
+      static void add( mutable_variant_object &mvo, const char* name, const fc::static_variant<Args...>& v, Resolver resolver )
+      {
+         //TODO: implement deserialization for static_variant
+      }
+
       /**
        * overload of to_variant_object for actions
        * @tparam Resolver
@@ -213,10 +219,11 @@ namespace impl {
          mutable_variant_object mvo;
          mvo("signatures", ptrx.signatures);
          mvo("compression", ptrx.compression);
-         mvo("hex_data", ptrx.data);
+         mvo("packed_context_free_data", ptrx.packed_context_free_data);
+         mvo("context_free_data", ptrx.get_context_free_data());
+         mvo("packed_trx", ptrx.packed_trx);
+         add(mvo, "transaction", ptrx.get_transaction(), resolver);
 
-         transaction trx = ptrx.get_transaction();
-         add(mvo, "data", trx, resolver);
          out(name, std::move(mvo));
       }
    };
@@ -301,8 +308,8 @@ namespace impl {
       static void extract( const variant& v, action& act, Resolver resolver )
       {
          const variant_object& vo = v.get_object();
-         FC_ASSERT(vo.contains("account"));
-         FC_ASSERT(vo.contains("name"));
+         EOS_ASSERT(vo.contains("account"), packed_transaction_type_exception, "Missing account");
+         EOS_ASSERT(vo.contains("name"), packed_transaction_type_exception, "Missing name");
          from_variant(vo["account"], act.account);
          from_variant(vo["name"], act.name);
 
@@ -332,28 +339,42 @@ namespace impl {
             }
          }
 
-         FC_ASSERT(!act.data.empty(), "Failed to deserialize data for ${account}:${name}", ("account", act.account)("name", act.name));
+         EOS_ASSERT(!act.data.empty(), packed_transaction_type_exception,
+                    "Failed to deserialize data for ${account}:${name}", ("account", act.account)("name", act.name));
       }
 
       template<typename Resolver>
       static void extract( const variant& v, packed_transaction& ptrx, Resolver resolver ) {
          const variant_object& vo = v.get_object();
-         FC_ASSERT(vo.contains("signatures"));
-         FC_ASSERT(vo.contains("compression"));
+         wdump((vo));
+         EOS_ASSERT(vo.contains("signatures"), packed_transaction_type_exception, "Missing signatures");
+         EOS_ASSERT(vo.contains("compression"), packed_transaction_type_exception, "Missing compression");
          from_variant(vo["signatures"], ptrx.signatures);
          from_variant(vo["compression"], ptrx.compression);
 
-         if (vo.contains("hex_data") && vo["hex_data"].is_string() && !vo["hex_data"].as_string().empty()) {
-            from_variant(vo["hex_data"], ptrx.data);
-         } else {
-            FC_ASSERT(vo.contains("data"));
-            if (vo["data"].is_string()) {
-               from_variant(vo["data"], ptrx.data);
-            } else {
-               transaction trx;
-               extract(vo["data"], trx, resolver);
-               ptrx.set_transaction(trx, ptrx.compression);
+         // TODO: Make this nicer eventually. But for now, if it works... good enough.
+         if( vo.contains("packed_trx") && vo["packed_trx"].is_string() && !vo["packed_trx"].as_string().empty() ) {
+            from_variant(vo["packed_trx"], ptrx.packed_trx);
+            auto trx = ptrx.get_transaction(); // Validates transaction data provided.
+            if( vo.contains("packed_context_free_data") && vo["packed_context_free_data"].is_string() && !vo["packed_context_free_data"].as_string().empty() ) {
+               from_variant(vo["packed_context_free_data"], ptrx.packed_context_free_data );
+            } else if( vo.contains("context_free_data") ) {
+               vector<bytes> context_free_data;
+               from_variant(vo["context_free_data"], context_free_data);
+               ptrx.set_transaction(trx, context_free_data, ptrx.compression);
             }
+         } else {
+            EOS_ASSERT(vo.contains("transaction"), packed_transaction_type_exception, "Missing transaction");
+            transaction trx;
+            vector<bytes> context_free_data;
+            extract(vo["transaction"], trx, resolver);
+            if( vo.contains("packed_context_free_data") && vo["packed_context_free_data"].is_string() && !vo["packed_context_free_data"].as_string().empty() ) {
+               from_variant(vo["packed_context_free_data"], ptrx.packed_context_free_data );
+               context_free_data = ptrx.get_context_free_data();
+            } else if( vo.contains("context_free_data") ) {
+               from_variant(vo["context_free_data"], context_free_data);
+            }
+            ptrx.set_transaction(trx, context_free_data, ptrx.compression);
          }
       }
    };
@@ -395,7 +416,6 @@ namespace impl {
          T& _val;
          Resolver _resolver;
    };
-
 
    template<typename M, typename Resolver, require_abi_t<M>>
    void abi_to_variant::add( mutable_variant_object &mvo, const char* name, const M& v, Resolver resolver ) {

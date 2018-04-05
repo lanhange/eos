@@ -4,10 +4,11 @@ Simple and fast setup of EOS.IO on Docker is also available.
 
 ## Install Dependencies
  - [Docker](https://docs.docker.com) Docker 17.05 or higher is required
+ - [docker-compose](https://docs.docker.com/compose/) version >= 1.10.0
 
 ## Docker Requirement
  - At least 8GB RAM (Docker -> Preferences -> Advanced -> Memory -> 8GB or above)
- 
+
 ## Build eos image
 
 ```bash
@@ -16,22 +17,22 @@ cd eos/Docker
 docker build . -t eosio/eos
 ```
 
-## Start eosiod docker container only
+## Start nodeos docker container only
 
 ```bash
-docker run --name eosiod -p 8888:8888 -p 9876:9876 -t eosio/eos start_eosiod.sh arg1 arg2
+docker run --name nodeos -p 8888:8888 -p 9876:9876 -t eosio/eos nodeosd.sh arg1 arg2
 ```
 
 By default, all data is persisted in a docker volume. It can be deleted if the data is outdated or corrupted:
 ``` bash
-$ docker inspect --format '{{ range .Mounts }}{{ .Name }} {{ end }}' eosiod
+$ docker inspect --format '{{ range .Mounts }}{{ .Name }} {{ end }}' nodeos
 fdc265730a4f697346fa8b078c176e315b959e79365fc9cbd11f090ea0cb5cbc
 $ docker volume rm fdc265730a4f697346fa8b078c176e315b959e79365fc9cbd11f090ea0cb5cbc
 ```
 
 Alternately, you can directly mount host directory into the container
 ```bash
-docker run --name eosiod -v /path-to-data-dir:/opt/eosio/bin/data-dir -p 8888:8888 -p 9876:9876 -t eosio/eos start_eosiod.sh arg1 arg2
+docker run --name nodeos -v /path-to-data-dir:/opt/eosio/bin/data-dir -p 8888:8888 -p 9876:9876 -t eosio/eos nodeosd.sh arg1 arg2
 ```
 
 ## Get chain info
@@ -40,35 +41,37 @@ docker run --name eosiod -v /path-to-data-dir:/opt/eosio/bin/data-dir -p 8888:88
 curl http://127.0.0.1:8888/v1/chain/get_info
 ```
 
-## Start both eosiod and walletd containers
+## Start both nodeos and keosd containers
 
 ```bash
-docker-compose up
+docker volume create --name=nodeos-data-volume
+docker volume create --name=keosd-data-volume
+docker-compose up -d
 ```
 
-After `docker-compose up`, two services named eosiod and walletd will be started. eosiod service would expose ports 8888 and 9876 to the host. walletd service does not expose any port to the host, it is only accessible to eosioc when runing eosioc is running inside the walletd container as described in "Execute eosioc commands" section.
+After `docker-compose up -d`, two services named `nodeosd` and `keosd` will be started. nodeos service would expose ports 8888 and 9876 to the host. keosd service does not expose any port to the host, it is only accessible to cleos when runing cleos is running inside the keosd container as described in "Execute cleos commands" section.
 
 
-### Execute eosioc commands
+### Execute cleos commands
 
-You can run the `eosioc` commands via a bash alias.
+You can run the `cleos` commands via a bash alias.
 
 ```bash
-alias eosioc='docker-compose exec walletd /opt/eosio/bin/eosioc -H eosiod'
-eosioc get info
-eosioc get account inita
+alias cleos='docker-compose exec keosd /opt/eosio/bin/cleos -H nodeosd'
+cleos get info
+cleos get account inita
 ```
 
 Upload sample exchange contract
 
 ```bash
-eosioc set contract exchange contracts/exchange/exchange.wast contracts/exchange/exchange.abi
+cleos set contract exchange contracts/exchange/exchange.wast contracts/exchange/exchange.abi
 ```
 
-If you don't need walletd afterwards, you can stop the walletd service using
+If you don't need keosd afterwards, you can stop the keosd service using
 
 ```bash
-docker-compose stop walletd
+docker-compose stop keosd
 ```
 ### Change default configuration
 
@@ -78,9 +81,9 @@ You can use docker compose override file to change the default configurations. F
 version: "2"
 
 services:
-  eosiod:
+  nodeos:
     volumes:
-      - eosiod-data-volume:/opt/eosio/bin/data-dir
+      - nodeos-data-volume:/opt/eosio/bin/data-dir
       - ./config2.ini:/opt/eosio/bin/data-dir/config.ini
 ```
 
@@ -95,5 +98,6 @@ docker-compose up
 The data volume created by docker-compose can be deleted as follows:
 
 ```bash
-docker volume rm docker_eosiod-data-volume
+docker volume rm nodeos-data-volume
+docker volume rm keosd-data-volume
 ```

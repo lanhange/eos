@@ -13,8 +13,6 @@ using namespace boost::multiprecision;
 
 template<size_t Size>
 using uint_t = number<cpp_int_backend<Size, Size, unsigned_magnitude, unchecked, void> >;
-template<size_t Size>
-using int_t = number<cpp_int_backend<Size, Size, signed_magnitude, unchecked, void> >;
 
 using uint8     = uint_t<8>;
 using uint16    = uint_t<16>;
@@ -23,8 +21,8 @@ using uint64    = uint_t<64>;
 
 using fixed_string32 = fc::fixed_string<fc::array<uint64,4>>;
 using fixed_string16 = fc::fixed_string<>;
-using type_name      = fixed_string32;
-using field_name     = fixed_string16;
+using type_name      = string;
+using field_name     = string;
 using table_name     = name;
 using action_name    = eosio::chain::action_name;
 
@@ -69,12 +67,13 @@ struct struct_def {
 
 struct action_def {
    action_def() = default;
-   action_def(const action_name& name, const type_name& type)
-   :name(name), type(type)
+   action_def(const action_name& name, const type_name& type, const string& ricardian_contract)
+   :name(name), type(type), ricardian_contract(ricardian_contract)
    {}
 
    action_name name;
-   type_name type;
+   type_name   type;
+   string      ricardian_contract; 
 };
 
 struct table_def {
@@ -90,16 +89,27 @@ struct table_def {
    type_name          type;        // type of binary data stored in this table
 };
 
+struct clause_pair {
+   clause_pair() = default;
+   clause_pair( const string& id, const string& body )
+   : id(id), body(body) 
+   {}
+
+   string id;
+   string body;
+};
+
 struct abi_def {
    abi_def() = default;
-   abi_def(const vector<type_def>& types, const vector<struct_def>& structs, const vector<action_def>& actions, const vector<table_def>& tables)
-   :types(types), structs(structs), actions(actions), tables(tables)
+   abi_def(const vector<type_def>& types, const vector<struct_def>& structs, const vector<action_def>& actions, const vector<table_def>& tables, const vector<clause_pair>& clauses)
+   :types(types), structs(structs), actions(actions), tables(tables), clauses(clauses)
    {}
 
    vector<type_def>     types;
    vector<struct_def>   structs;
    vector<action_def>   actions;
    vector<table_def>    tables;
+   vector<clause_pair>  clauses;
 };
 
 struct newaccount {
@@ -152,6 +162,7 @@ struct updateauth {
    permission_name                   permission;
    permission_name                   parent;
    authority                         data;
+   uint32_t                          delay;
 
    static account_name get_account() {
       return config::system_account_name;
@@ -270,23 +281,36 @@ struct vetorecovery {
    }
 };
 
+struct canceldelay {
+   transaction_id_type   trx_id;
+
+   static account_name get_account() {
+      return config::system_account_name;
+   }
+
+   static action_name get_name() {
+      return N(canceldelay);
+   }
+};
 
 } } } /// namespace eosio::chain::contracts
 
 FC_REFLECT( eosio::chain::contracts::type_def                         , (new_type_name)(type) )
 FC_REFLECT( eosio::chain::contracts::field_def                        , (name)(type) )
 FC_REFLECT( eosio::chain::contracts::struct_def                       , (name)(base)(fields) )
-FC_REFLECT( eosio::chain::contracts::action_def                       , (name)(type) )
+FC_REFLECT( eosio::chain::contracts::action_def                       , (name)(type)(ricardian_contract) )
+FC_REFLECT( eosio::chain::contracts::clause_pair                      , (id)(body) )
 FC_REFLECT( eosio::chain::contracts::table_def                        , (name)(index_type)(key_names)(key_types)(type) )
-FC_REFLECT( eosio::chain::contracts::abi_def                          , (types)(structs)(actions)(tables) )
+FC_REFLECT( eosio::chain::contracts::abi_def                          , (types)(structs)(actions)(tables)(clauses) )
 
 FC_REFLECT( eosio::chain::contracts::newaccount                       , (creator)(name)(owner)(active)(recovery) )
 FC_REFLECT( eosio::chain::contracts::setcode                          , (account)(vmtype)(vmversion)(code) ) //abi
 FC_REFLECT( eosio::chain::contracts::setabi                           , (account)(abi) )
-FC_REFLECT( eosio::chain::contracts::updateauth                       , (account)(permission)(parent)(data) )
+FC_REFLECT( eosio::chain::contracts::updateauth                       , (account)(permission)(parent)(data)(delay) )
 FC_REFLECT( eosio::chain::contracts::deleteauth                       , (account)(permission) )
 FC_REFLECT( eosio::chain::contracts::linkauth                         , (account)(code)(type)(requirement) )
 FC_REFLECT( eosio::chain::contracts::unlinkauth                       , (account)(code)(type) )
 FC_REFLECT( eosio::chain::contracts::postrecovery                     , (account)(data)(memo) )
 FC_REFLECT( eosio::chain::contracts::passrecovery                     , (account) )
 FC_REFLECT( eosio::chain::contracts::vetorecovery                     , (account) )
+FC_REFLECT( eosio::chain::contracts::canceldelay                      , (trx_id) )

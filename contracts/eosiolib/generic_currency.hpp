@@ -7,6 +7,8 @@
 #include <eosiolib/action.hpp>
 #include <string>
 
+#define N(X) ::eosio::string_to_name(#X)
+
 namespace eosio {
    using std::string;
 
@@ -21,6 +23,9 @@ namespace eosio {
 
           ACTION( code, issue ) {
              typedef action_meta<code,N(issue)> meta;
+             
+             issue() { }
+             issue(account_name a, asset q): to(a), quantity(q) { } 
              account_name to;
              asset        quantity;
 
@@ -113,7 +118,7 @@ namespace eosio {
                 t.emplace(code, [&](currency_stats& s) { s.supply = act.quantity; });
              }
 
-             set_balance( code, get_balance( code ) + act.quantity, code, 0 );
+             set_balance( code, get_balance( code ) + token_type(act.quantity), code, 0 );
 
              inline_transfer( code, act.to, act.quantity );
           }
@@ -123,8 +128,8 @@ namespace eosio {
              require_auth( act.from );
              require_recipient(act.to,act.from);
 
-             set_balance( act.from, get_balance( act.from ) - act.quantity, act.from, act.from );
-             set_balance( act.to, get_balance( act.to ) + act.quantity, act.from, 0 );
+             set_balance( act.from, get_balance( act.from ) - token_type(act.quantity), act.from, act.from );
+             set_balance( act.to, get_balance( act.to ) + token_type(act.quantity), act.from, 0 );
           }
 
           static void inline_transfer( account_name from, account_name to, token_type quantity,
@@ -134,6 +139,17 @@ namespace eosio {
              act.send();
           }
 
+         static void inline_issue(account_name to, token_type quantity)
+         {
+            action act(permission_level(code, N(active)), issue(to, asset(quantity)));
+            act.send();
+         }
+
+          static token_type get_total_supply() {
+             stats t( code, code );
+             auto ptr = t.find( symbol );
+             return ptr != t.end() ? ptr->supply : token_type(0);
+          }
 
          static void apply( account_name c, action_name act) {
             eosio::dispatch<generic_currency, transfer, issue>(c,act);

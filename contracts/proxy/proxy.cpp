@@ -5,7 +5,7 @@
 #include <proxy/proxy.hpp>
 #include <eosio.system/eosio.system.hpp>
 #include <eosiolib/transaction.hpp>
-#include <currency/currency.hpp>
+#include <eosiolib/currency.hpp>
 
 namespace proxy {
    using namespace eosio;
@@ -34,9 +34,9 @@ namespace proxy {
    };
 
    template<typename T>
-   void apply_transfer(account_name code, const T& transfer) {
+   void apply_transfer(uint64_t receiver, account_name code, const T& transfer) {
       config code_config;
-      const auto self = current_receiver();
+      const auto self = receiver;
       auto get_res = configs::get(code_config, self);
       eosio_assert(get_res, "Attempting to use unconfigured proxy");
       if (transfer.from == self) {
@@ -51,25 +51,27 @@ namespace proxy {
          configs::store(code_config, self);
 
          transaction out;
-         out.actions.emplace_back(vector<permission_level>{{self, N(active)}}, new_transfer);
-         out.send(id, now() + code_config.delay);
+         out.actions.emplace_back(permission_level{self, N(active)}, N(currency), N(transfer), new_transfer);
+         out.delay_sec = code_config.delay;
+         out.send(id, self);
       }
    }
 
-   void apply_setowner(set_owner params) {
-      const auto self = current_receiver();
+   void apply_setowner(uint64_t receiver, set_owner params) {
+      const auto self = receiver;
+      require_auth(params.owner);
       config code_config;
       configs::get(code_config, self);
       code_config.owner = params.owner;
       code_config.delay = params.delay;
-      eosio::print("Setting owner to: ", name(params.owner), " with delay: ", params.delay, "\n");
+      eosio::print("Setting owner to: ", name{params.owner}, " with delay: ", params.delay, "\n");
       configs::store(code_config, self);
    }
 
    template<size_t ...Args>
-   void apply_onerror( const deferred_transaction& failed_dtrx ) {
+   void apply_onerror(uint64_t receiver, const deferred_transaction& failed_dtrx ) {
       eosio::print("starting onerror\n");
-      const auto self = current_receiver();
+      const auto self = receiver;
       config code_config;
       eosio_assert(configs::get(code_config, self), "Attempting use of unconfigured proxy");
 
@@ -77,7 +79,9 @@ namespace proxy {
       configs::store(code_config, self);
 
       eosio::print("Resending Transaction: ", failed_dtrx.sender_id, " as ", id, "\n");
-      failed_dtrx.send(id, now() + code_config.delay);
+      deferred_transaction failed_dtrx_copy = failed_dtrx;
+      failed_dtrx_copy.delay_sec = code_config.delay;
+      failed_dtrx_copy.send(id, self);
    }
 }
 
@@ -87,20 +91,20 @@ using namespace eosio;
 extern "C" {
 
     /// The apply method implements the dispatch of events to this contract
-    void apply( uint64_t code, uint64_t action ) {
+    void apply( uint64_t receiver, uint64_t code, uint64_t action ) {
        if ( code == N(eosio)) {
           if (action == N(onerror)) {
-             apply_onerror(deferred_transaction::from_current_action());
+             apply_onerror(receiver, deferred_transaction::from_current_action());
           } if( action == N(transfer) ) {
-             apply_transfer(code, unpack_action<eosiosystem::contract<N(eosio.system)>::currency::transfer_memo>());
+             apply_transfer(receiver, code, unpack_action_data<eosiosystem::contract<N(eosio.system)>::currency::transfer_memo>());
           }
        } else if ( code == N(currency) ) {
           if( action == N(transfer) ) {
-             apply_transfer(code, unpack_action<currency::contract::transfer_memo>());
+             apply_transfer(receiver, code, unpack_action_data<eosio::currency::transfer>());
           }
-       } else if (code == current_receiver() ) {
+       } else if (code == receiver ) {
           if ( action == N(setowner)) {
-             apply_setowner(current_action<set_owner>());
+             apply_setowner(receiver, current_action_data<set_owner>());
           }
        }
     }
